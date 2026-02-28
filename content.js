@@ -44,6 +44,55 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     }).catch(err => console.debug("Popup closed, skipping progress update"));
   };
 
+  const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  const postJsonWithRetry = async (url, payload, label) => {
+    const attempts = 5;
+    const baseDelayMs = 400;
+    const maxDelayMs = 5000;
+    let lastError;
+
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+      try {
+        const res = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+
+        if (res.ok) {
+          return await res.json();
+        }
+
+        const status = res.status;
+        if (status === 401 || status === 403) {
+          throw new Error(`${label} auth error ${status}`);
+        }
+
+        const retryable =
+          status === 429 || status === 500 || status === 502 || status === 503 || status === 504;
+        if (!retryable) {
+          throw new Error(`${label} error ${status}`);
+        }
+
+        const retryAfter = res.headers.get("Retry-After");
+        const retryMs = retryAfter ? Number(retryAfter) * 1000 : null;
+        const backoff = Math.min(baseDelayMs * Math.pow(2, attempt - 1), maxDelayMs);
+        const waitMs = Math.max(retryMs || 0, backoff) + Math.floor(Math.random() * 150);
+        await delay(waitMs);
+      } catch (err) {
+        lastError = err;
+        if (attempt === attempts) {
+          throw err;
+        }
+        const backoff = Math.min(baseDelayMs * Math.pow(2, attempt - 1), maxDelayMs);
+        await delay(backoff + Math.floor(Math.random() * 150));
+      }
+    }
+
+    throw lastError || new Error(`${label} failed`);
+  };
+
   // Fetch one page of leads
   async function fetchLeadsPage(page, pageSize = 100) {
     const payload = {
@@ -62,17 +111,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       property_flags_and_or: "or",
     };
 
-    const res = await fetch("https://api.dealmachine.com/v2/leads/", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
-
-    if (!res.ok) {
-      throw new Error(`DealMachine API error ${res.status}`);
-    }
-
-    return res.json();
+    return postJsonWithRetry("https://api.dealmachine.com/v2/leads/", payload, "Leads API");
   }
 
   // Fetch property details (includes phone_numbers with contact phone_1/2/3)
@@ -96,23 +135,16 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       return null;
     }
 
-    const res = await fetch("https://api.dealmachine.com/v2/property/", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
-
-    if (!res.ok) {
-      throw new Error(`Property API error ${res.status}`);
-    }
-
-    const json = await res.json();
+    const json = await postJsonWithRetry("https://api.dealmachine.com/v2/property/", payload, "Property API");
     return (json && json.results && json.results.property) || null;
   }
 
   (async () => {
     try {
-      const pageSize = 100;
+      const requestedPageSize = Number(request.pageSize);
+      const pageSize = Number.isFinite(requestedPageSize) && requestedPageSize > 0
+        ? Math.min(requestedPageSize, 500)
+        : 200;
       let page = 1;
       const seen = new Set();
       const propertyDetailCache = new Map();
@@ -120,6 +152,27 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       let totalExpected = null;
       let repeatPageCount = 0;
       let total = 0;
+      const detailConcurrency = 8;
+      const pageDelayMs = 50;
+
+      const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+      const runWithConcurrency = async (items, limit, worker) => {
+        const max = Math.max(1, Math.min(limit, items.length));
+        let index = 0;
+        const runners = Array.from({ length: max }, async () => {
+          while (!isStopRequested) {
+            const current = index++;
+            if (current >= items.length) return;
+            try {
+              await worker(items[current], current);
+            } catch (err) {
+              console.warn("Concurrent worker error:", err);
+            }
+          }
+        });
+        await Promise.all(runners);
+      };
 
       // CSV header
       const rows = [
@@ -187,19 +240,36 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           return hasPlus ? `+${digits}` : digits;
         };
 
+        const toTitleCase = (value) => {
+          if (value === null || value === undefined) return "";
+          const str = String(value).trim();
+          if (!str) return "";
+          return str.toLowerCase().replace(/\b([a-z])/g, (m) => m.toUpperCase());
+        };
+
         const tryAddNumber = (raw, street, city, state, zip, contact) => {
           const normalized = normalizePhone(raw);
           if (!normalized || seen.has(normalized)) return false;
           seen.add(normalized);
           total++;
+          const firstName = toTitleCase(
+            contact?.given_name || contact?.first_name || contact?.firstname || ""
+          );
+          const middleName = toTitleCase(
+            contact?.middle_name || contact?.middle_initial || contact?.middle || ""
+          );
+          const lastName = toTitleCase(
+            contact?.surname || contact?.last_name || contact?.lastname || ""
+          );
           rows.push([
             street,
             city,
             state,
             zip,
             String(raw).trim(),
-            contact?.given_name || "",
-            contact?.surname || "",
+            firstName,
+            middleName,
+            lastName,
           ]);
           return true;
         };
@@ -298,6 +368,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         };
 
         let newPropsThisPage = 0;
+        const detailsQueue = [];
         for (const p of props) {
           const propKey =
             p.property_id ||
@@ -322,9 +393,17 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           const addedFromLeads = extractNumbersFromProperty(p, street, city, state, zip);
 
           // If no numbers were found, try the property details endpoint
-          if (addedFromLeads === 0 && !isStopRequested) {
+          if (addedFromLeads === 0) {
+            detailsQueue.push({ p, street, city, state, zip });
+          }
+        }
+
+        if (detailsQueue.length > 0 && !isStopRequested) {
+          await runWithConcurrency(detailsQueue, detailConcurrency, async (item) => {
+            const { p, street, city, state, zip } = item;
             try {
-              const cacheKey = p.property_id || p.property_data_id || p.property_address_mak || p.property_address_full;
+              const cacheKey =
+                p.property_id || p.property_data_id || p.property_address_mak || p.property_address_full;
               if (!propertyDetailCache.has(cacheKey)) {
                 const details = await fetchPropertyDetails(p);
                 propertyDetailCache.set(cacheKey, details || null);
@@ -336,7 +415,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             } catch (err) {
               console.warn("Property details fetch failed:", err);
             }
-          }
+          });
         }
 
         sendProgress(page, total);
@@ -359,7 +438,9 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         page++;
 
         // Small delay to avoid rate limiting
-        await new Promise(resolve => setTimeout(resolve, 200));
+        if (pageDelayMs > 0) {
+          await sleep(pageDelayMs);
+        }
       }
 
       console.log(`🎉 Scraping complete! Total unique wireless numbers: ${total}`);
